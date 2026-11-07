@@ -2,3 +2,4 @@ node_modules/
 coverage/
 dist/
 .before/
+package-lock.json

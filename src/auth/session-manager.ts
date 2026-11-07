@@ -1,71 +1,80 @@
 /**
- * Session token refresh — pre-refactor version.
+ * Session token refresh with single-flight (request coalescing) semantics.
  *
- * Bug: refreshToken() has no single-flight protection. Every concurrent caller
- * issues its own HTTP refresh for the same session, so a 401 storm produces N
- * overlapping refreshes per session, the last writer wins, and every earlier
- * response is already stale. That is the 401 loop seen in production under
- * concurrency.
+ * Problem this replaces: `Promise.all(users.map(u => refreshToken(u.id)))`
+ * fired one HTTP refresh per concurrent caller. On a 401 storm every request
+ * handler refreshed the same session independently, the last writer won, and
+ * the earlier responses were already stale — the classic 401 refresh loop.
+ *
+ * Fix: at most one refresh request is in flight per session id. Concurrent
+ * callers within the same event loop tick await the same Promise, so they all
+ * receive one token and one HTTP round trip is spent.
  */
 
-export interface TokenPair {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
+export type RefreshTransport = (sessionId: string) => Promise<string>;
+
+export interface SessionManagerOptions {
+  /** Override the HTTP layer (used by tests and by non-fetch runtimes). */
+  transport?: RefreshTransport;
+  /** Endpoint hit by the default transport. */
+  endpoint?: string;
 }
 
 export class SessionManager {
-  private readonly tokens = new Map<string, TokenPair>();
+  /** sessionId -> the in-flight refresh for that session. */
+  private readonly inflight = new Map<string, Promise<string>>();
 
-  constructor(private readonly endpoint: string = "/auth/refresh") {}
+  private readonly transport: RefreshTransport;
 
-  getToken(sessionId: string): TokenPair | undefined {
-    return this.tokens.get(sessionId);
+  constructor(options: SessionManagerOptions = {}) {
+    const endpoint = options.endpoint ?? "/auth/refresh";
+    this.transport =
+      options.transport ??
+      (async (sessionId: string) => {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionId }),
+        });
+        if (!res.ok) {
+          throw new Error(`refresh failed: ${res.status}`);
+        }
+        const body = (await res.json()) as { accessToken?: string };
+        if (!body.accessToken) {
+          throw new Error("refresh failed: no accessToken in response");
+        }
+        return body.accessToken;
+      });
   }
 
   /**
-   * Refresh every listed session in parallel.
-   *
-   * NOTE: this is the call site that triggers the loop — Promise.all over an
-   * array of refresh requests with no mutex means duplicate in-flight refreshes
-   * for the same session id.
+   * Refresh the access token for `sessionId`, joining an existing in-flight
+   * refresh instead of starting a second one.
    */
-  async refreshAll(sessionIds: string[]): Promise<TokenPair[]> {
-    return Promise.all(sessionIds.map((id) => this.refreshToken(id)));
-  }
+  refreshToken(sessionId: string): Promise<string> {
+    const existing = this.inflight.get(sessionId);
+    if (existing !== undefined) {
+      return existing;
+    }
 
-  /**
-   * Refresh one session. No coalescing: two calls for the same session id in
-   * the same tick both go to the network.
-   */
-  async refreshToken(sessionId: string): Promise<TokenPair> {
-    const res = await fetch(this.endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId }),
+    const attempt = this.transport(sessionId);
+
+    // Track the wrapped promise so waiters share both resolution and rejection.
+    const tracked: Promise<string> = attempt.finally(() => {
+      // Only clear the slot if it still holds THIS flight. A newer refresh may
+      // have replaced it while we were waiting, and deleting unconditionally
+      // would drop that newer request's bookkeeping.
+      if (this.inflight.get(sessionId) === tracked) {
+        this.inflight.delete(sessionId);
+      }
     });
 
-    if (!res.ok) {
-      throw new Error(`refresh failed: ${res.status}`);
-    }
+    this.inflight.set(sessionId, tracked);
+    return tracked;
+  }
 
-    const body = (await res.json()) as {
-      accessToken?: string;
-      refreshToken?: string;
-      expiresIn?: number;
-    };
-
-    if (!body.accessToken || !body.refreshToken) {
-      throw new Error("refresh failed: incomplete token pair");
-    }
-
-    const pair: TokenPair = {
-      accessToken: body.accessToken,
-      refreshToken: body.refreshToken,
-      expiresAt: Date.now() + (body.expiresIn ?? 3600) * 1000,
-    };
-
-    this.tokens.set(sessionId, pair);
-    return pair;
+  /** Number of refreshes currently in flight — diagnostics only. */
+  get inFlightCount(): number {
+    return this.inflight.size;
   }
 }
